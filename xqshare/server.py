@@ -591,12 +591,26 @@ class XtQuantService(rpyc.Service):
                     info['end_time'] = str(dt.datetime.fromtimestamp(info.get('end_time') / 1000))
                     status['result'][stock] = info
 
-        # 调用原始方法（incrementally 参数需要转换为 None 或 bool）
-        inc = incrementally
-        self._xtdata.download_history_data2(
-            stock_list, period, start_time, end_time,
-            callback=on_progress, incrementally=inc
-        )
+        # Older QMT builds accept callback but do not accept the incrementally keyword.
+        if incrementally is None:
+            self._xtdata.download_history_data2(
+                stock_list, period, start_time, end_time,
+                callback=on_progress
+            )
+        else:
+            try:
+                self._xtdata.download_history_data2(
+                    stock_list, period, start_time, end_time,
+                    callback=on_progress, incrementally=incrementally
+                )
+            except TypeError as exc:
+                if "incrementally" not in str(exc):
+                    raise
+                logger.warning("download_history_data2 does not support incrementally; retrying without it")
+                self._xtdata.download_history_data2(
+                    stock_list, period, start_time, end_time,
+                    callback=on_progress
+                )
 
         return status
 
