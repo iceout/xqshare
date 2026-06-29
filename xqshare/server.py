@@ -130,6 +130,11 @@ def log_api_call(func_name: str = None):
         def wrapper(self, *args, **kwargs):
             name = func_name or func.__name__
             client_info = getattr(self, '_client_info', 'unknown')
+            args = tuple(_to_local_builtin(arg) for arg in args)
+            kwargs = {
+                key: _to_local_builtin(value)
+                for key, value in kwargs.items()
+            }
             return _log_call(name, client_info, func, self, *args, **kwargs)
         return wrapper
     return decorator
@@ -249,6 +254,61 @@ def _serialize_for_transfer(result):
 
 # ==================== 模块代理（带日志和权限检查） ====================
 
+def _to_local_builtin(value):
+    """Convert RPyC netref containers into real local Python builtins.
+
+    xtquant's pybind/C-extension APIs reject RPyC netref list/dict/str objects
+    even when they print exactly like normal Python values.
+    """
+    module_name = type(value).__module__
+    type_name = type(value).__name__.lower()
+    is_netref = module_name.startswith("rpyc.core.netref")
+
+    if is_netref:
+        if "list" in type_name:
+            return [_to_local_builtin(item) for item in list(value)]
+        if "tuple" in type_name:
+            return tuple(_to_local_builtin(item) for item in list(value))
+        if "dict" in type_name:
+            return {
+                _to_local_builtin(key): _to_local_builtin(item)
+                for key, item in dict(value).items()
+            }
+        if "str" in type_name:
+            return str(value)
+        if "bool" in type_name:
+            return bool(value)
+        if "int" in type_name:
+            return int(value)
+        if "float" in type_name:
+            return float(value)
+        if callable(value):
+            return value
+
+        try:
+            from rpyc.utils.classic import obtain
+            return _to_local_builtin(obtain(value))
+        except Exception:
+            return value
+
+    if callable(value):
+        return value
+
+    if value is None or isinstance(value, (str, int, float, bool, bytes)):
+        return value
+    if isinstance(value, list):
+        return [_to_local_builtin(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_local_builtin(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            _to_local_builtin(key): _to_local_builtin(item)
+            for key, item in value.items()
+        }
+
+    return value
+
+
 class LoggingProxy:
     """通用代理：拦截模块/对象的方法调用并记录日志，支持递归包装返回对象和权限检查"""
 
@@ -272,6 +332,11 @@ class LoggingProxy:
         if callable(attr):
             def wrapper(*args, **kwargs):
                 full_name = f"{target_name}.{name}"
+                args = tuple(_to_local_builtin(arg) for arg in args)
+                kwargs = {
+                    key: _to_local_builtin(value)
+                    for key, value in kwargs.items()
+                }
 
                 # 权限检查
                 if permission_checker and account_level:
@@ -526,12 +591,26 @@ class XtQuantService(rpyc.Service):
                     info['end_time'] = str(dt.datetime.fromtimestamp(info.get('end_time') / 1000))
                     status['result'][stock] = info
 
-        # 调用原始方法（incrementally 参数需要转换为 None 或 bool）
-        inc = incrementally
-        self._xtdata.download_history_data2(
-            stock_list, period, start_time, end_time,
-            callback=on_progress, incrementally=inc
-        )
+        # Older QMT builds accept callback but do not accept the incrementally keyword.
+        if incrementally is None:
+            self._xtdata.download_history_data2(
+                stock_list, period, start_time, end_time,
+                callback=on_progress
+            )
+        else:
+            try:
+                self._xtdata.download_history_data2(
+                    stock_list, period, start_time, end_time,
+                    callback=on_progress, incrementally=incrementally
+                )
+            except TypeError as exc:
+                if "incrementally" not in str(exc):
+                    raise
+                logger.warning("download_history_data2 does not support incrementally; retrying without it")
+                self._xtdata.download_history_data2(
+                    stock_list, period, start_time, end_time,
+                    callback=on_progress
+                )
 
         return status
 
